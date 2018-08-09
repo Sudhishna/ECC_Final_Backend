@@ -1,0 +1,113 @@
+# -*- mode: ruby -*-
+# vi: set ft=ruby :
+
+require 'getoptlong'
+
+opts = GetoptLong.new(
+  [ '--vqfx-id', GetoptLong::OPTIONAL_ARGUMENT ],
+  [ '--ports-map', GetoptLong::OPTIONAL_ARGUMENT ],
+  [ '--dev-name', GetoptLong::OPTIONAL_ARGUMENT ]
+)
+
+id=2
+port_map = ""
+dev_name = ""
+opts.each do |opt, arg|
+  case opt
+    when '--vqfx-id'
+      id=arg
+    when '--ports-map'
+      port_map=arg
+    when '--dev-name'
+      dev_name=arg
+  end
+end
+
+ports_map = port_map.split("*").each_with_object({}) do |str, h| 
+  k,v = str.split(":")
+  v.sub! '[', ''
+  v.sub! ']', ''
+  v.sub! ' ', ''
+  val = v.split(",").map(&:to_i)
+  print val
+  h[k] = val
+end
+
+print ports_map
+print dev_name
+
+VAGRANTFILE_API_VERSION = "2"
+
+## Define ports mapping to create a Full Mesh between all 4 vqfx
+
+dataports_size = ports_map["#{id}"].count
+puts dataports_size
+puts ports_map["#{id.to_sym}"]
+
+Vagrant.configure(VAGRANTFILE_API_VERSION) do |config|
+
+    config.ssh.insert_key = false
+
+    re_name  = ( "vqfx" + id.to_s ).to_sym
+    pfe_name = ( "vqfx" + id.to_s + "-pfe" ).to_sym
+    srv_name  = ( "srv" + id.to_s ).to_sym
+
+    # ##############################
+    # ## Packet Forwarding Engine ##
+    # ##############################
+    config.vm.define pfe_name do |vqfxpfe|
+        vqfxpfe.ssh.insert_key = false
+        vqfxpfe.vm.box = 'juniper/vqfx10k-pfe'
+
+        # DO NOT REMOVE / NO VMtools installed
+        vqfxpfe.vm.synced_folder '.', '/vagrant', disabled: true
+       vqfxpfe.vm.network 'private_network', auto_config: false, nic_type: '82540EM', virtualbox__intnet: "vqfx_internal_#{id}"
+
+    end
+
+    ##########################
+    ## Routing Engine  #######
+    ##########################
+    config.vm.define re_name do |vqfx|
+        vqfx.vm.hostname = "vqfx#{id}"
+        vqfx.vm.box = 'juniper/vqfx10k-re'
+
+        # DO NOT REMOVE / NO VMtools installed
+        vqfx.vm.synced_folder '.', '/vagrant', disabled: true
+
+        # Management port
+        vqfx.vm.network 'private_network', auto_config: false, nic_type: '82540EM', virtualbox__intnet: "vqfx_internal_#{id}"
+        vqfx.vm.network 'private_network', auto_config: false, nic_type: '82540EM', virtualbox__intnet: "reserved_bridge"
+
+        # Dataplane ports (server) 
+        if dev_name == "leaf"
+           vqfx.vm.network 'private_network', auto_config: false, nic_type: '82540EM', virtualbox__intnet: "server_vqfx#{id}"
+        end
+
+        # Dataplane ports (other spine and leaves)
+        for seg_id in 0..dataports_size-1 do
+           vqfx.vm.network 'private_network', auto_config: false, nic_type: '82540EM', virtualbox__intnet: ports_map["#{id}"][seg_id].to_s
+        end
+    end
+
+    config.vm.provision "ansible" do |ansible|
+        ansible.limit = "all,localhost"
+        ansible.playbook = "create_inventory.yml"
+        ansible.extra_vars = {
+          host_name:"vqfx#{id}"
+        }
+    end
+
+    ##########################
+    ## Server          #######
+    ##########################
+    config.vm.define srv_name do |srv|
+        srv.vm.box = "robwc/minitrusty64"
+        srv.vm.hostname = "server#{id}"
+        srv.vm.network 'private_network', ip: "10.10.#{id}.2", virtualbox__intnet: "server_vqfx#{id}"
+        srv.ssh.insert_key = true
+        srv.vm.provision "shell",
+           inline: "sudo route add -net 10.10.0.0 netmask 255.255.0.0 gw 10.10.#{id}.1"
+    end
+
+end
